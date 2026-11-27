@@ -243,7 +243,88 @@ redis-cli get "cron:dead-letter:cron/v1/unlock"
 - P0 (`unlock` missed > 5 min, `index-events` missed > 15 min): On-call engineer immediately.
 - P1 (`reconcile` missed > 12 h, `expire` missed > 48 h): Engineering lead.
 
+## Payment Reconciliation Mismatches
+
+### Symptoms
+
+- Sentry alert `PaymentReconciliationMismatch` fires (tag `service: payment-reconciliation`)
+- `level = "error"` logs with `metric = "payment.reconciliation.mismatch"` in the log aggregator
+- A user reports a payment that succeeded at Paystack/Stripe but the gift is still `pending`/`funded` (or vice versa)
+- Rows accumulate in the `reconciliation_errors` table
+
+### How alerting works
+
+The reconciliation job (`payment-reconciliation.service.ts`, run by the
+`/api/v1/cron/reconcile` cron every 6 hours) compares Paystack/Stripe records against the
+database. On every mismatch it:
+
+1. Writes a row to `reconciliation_errors` (provider, provider reference, gift id, expected vs
+   actual status, raw provider payload, `resolved = false`).
+2. Emits a structured `error`-level log entry with the fields
+   `metric=payment.reconciliation.mismatch`, `provider`, `providerReference`, `giftId`,
+   `expectedStatus`, `actualStatus`, `reconciliationErrorId`.
+3. Sends an event to Sentry (tag `service: payment-reconciliation`,
+   `alert: payment-reconciliation-mismatch`).
+
+### Alert routing (PagerDuty / Sentry)
+
+- **Sentry → PagerDuty**: the Sentry alert rule `PaymentReconciliationMismatch` is routed to the
+  PagerDuty service **Lumigift Payments** via the Sentry PagerDuty integration.
+  - Severity **P1** when ≥ 1 mismatch is detected (payments are money-critical).
+  - Auto-resolve in PagerDuty when the Sentry issue is resolved (i.e. after the underlying
+    mismatches are fixed and no new ones are detected in the next reconcile run).
+- **Log-based alert**: Betterstack rule `level = "error"` AND
+  `metric = "payment.reconciliation.mismatch"` > 0 in 5 min → Slack `#incidents`.
+- If PagerDuty is unavailable, Sentry email alerts to the on-call rotation are the fallback.
+
+### Diagnosis
+
+1. List unresolved mismatches via the admin endpoint:
+   ```bash
+   curl -X GET "https://lumigift.app/api/v1/admin/reconciliation-errors?resolved=false&limit=50" \
+     -H "Authorization: Bearer $ADMIN_API_TOKEN"
+   ```
+2. Inspect the rows directly if needed:
+   ```sql
+   SELECT id, provider, provider_reference, gift_id, expected_status, actual_status,
+          created_at
+   FROM reconciliation_errors
+   WHERE resolved = false
+   ORDER BY created_at ASC;
+   ```
+3. Cross-check the provider dashboard (Paystack/Stripe) for the referenced transaction.
+4. Check the `cron.run` logs for the `reconcile` job and the Sentry issue for stack context.
+
+### Resolution
+
+1. Determine the source of truth: the payment provider record wins for payment status.
+2. Correct the DB record (or re-trigger the reconcile cron if the fix is in code):
+   ```sql
+   UPDATE gifts SET status = '<correct_status>' WHERE id = '<gift_id>';
+   ```
+3. Re-run reconciliation to confirm no new mismatch is emitted:
+   ```bash
+   curl -X GET "https://lumigift.app/api/v1/cron/reconcile" \
+     -H "Authorization: Bearer $CRON_SECRET"
+   ```
+4. After investigation, mark the row(s) resolved:
+   ```sql
+   UPDATE reconciliation_errors
+   SET resolved = true, resolved_at = NOW(), resolved_by = '<your-name>',
+       resolution_notes = '<what was done>'
+   WHERE id = '<reconciliation_error_id>';
+   ```
+   (Or use the admin endpoint's resolve action if available.)
+5. Resolve the Sentry issue once the backlog of unresolved rows is empty.
+
+### Escalation Path
+
+- Any mismatch involving real money movement: on-call engineer immediately (P1).
+- > 10 unresolved mismatches or a systematic pattern: escalate to engineering lead and CTO.
+- Suspected double-charge / double-refund: **STOP** manual corrections and escalate to CTO.
+
 ## Application Performance Degradation
+=======
 
 ### Symptoms
 
@@ -668,127 +749,104 @@ stellar contract invoke \
 
 ---
 
-## Database Failover Runbook (Issue #560)
+## Blue-Green / Canary Deployment and Rollback
 
-Production PostgreSQL runs as a primary RDS instance in the primary region with a
-cross-region read replica in the secondary region (provisioned via Terraform). This
-section covers promoting the replica to primary when the primary region is unavailable.
+Lumigift releases use a canary-first, blue-green promotion strategy. No change
+goes to 100% of production traffic without passing a canary window and an
+explicit human approval. The workflow lives in `.github/workflows/deploy-canary.yml`.
 
-### RTO Target
+### Release Flow
 
-| Metric | Target | Notes |
-| ------ | ------ | ----- |
-| RTO (Recovery Time Objective) | **< 30 minutes** | Measured from incident declaration to validated application health on the promoted replica |
-| RPO (Recovery Point Objective) | < 5 minutes | Cross-region replica lag; some recent writes may be lost |
+1. **Deploy canary (10% of traffic)**
+   - Merging to `main` triggers `deploy-canary.yml`, which deploys the new build
+     as a Vercel preview/canary deployment and routes **10% of production traffic**
+     to it.
+   - The previous (stable) deployment continues to serve the remaining 90%
+     (the "blue" side of blue-green).
 
-The RTO clock starts when the on-call engineer declares the failover. Every step below
-should be timed and recorded in the incident channel so the RTO can be measured.
+2. **Monitoring window (15 minutes)**
+   - The canary is monitored for **15 minutes**.
+   - The gate metric is the **error rate** (5xx responses / total requests),
+     sourced from the `LumigiftHighErrorRate` alert and the Grafana/Loki
+     dashboards (see [Log Aggregation](#log-aggregation)).
 
-### Failover Procedure
+3. **Automatic rollback on error-rate breach**
+   - If the canary error rate **exceeds 1%** at any point during the 15-minute
+     window, the workflow **automatically rolls back**: traffic is shifted back
+     to the stable deployment and the canary is discarded. No approval is needed
+     for an automatic rollback.
 
-1. **Confirm the primary is unrecoverable** (or that failover is faster than waiting):
-   - Check RDS status in the primary region console / `aws rds describe-db-instances`.
-   - Confirm the cross-region replica is healthy and its `ReplicaLag` is acceptable:
-     ```bash
-     aws rds describe-db-instances \
-       --region "$SECONDARY_REGION" \
-       --db-instance-identifier "$REPLICA_INSTANCE_ID" \
-       --query 'DBInstances[0].{Status:DBInstanceStatus,Lag:StatusInfos}'
-     ```
-   - Record the timestamp — this is the RTO start.
+4. **Promote to production (explicit approval)**
+   - If the canary stays below 1% error rate for the full window, the workflow
+     pauses at the `production` GitHub Environment, which requires **explicit
+     approval** from a designated reviewer.
+   - On approval, the canary is promoted to 100% of traffic (green becomes blue).
 
-2. **Promote the read replica to primary**:
+### Approving Promotion in GitHub Actions
+
+1. Open the running `deploy-canary.yml` run in the **Actions** tab.
+2. The job `promote-to-production` will show **"Waiting for approval"**.
+3. Click **Review deployments**, select the `production` environment, and click
+   **Approve and deploy**.
+4. Only members of the required reviewers configured on the `production`
+   environment (Settings → Environments → `production`) can approve.
+
+> **Do not approve** if the canary error rate is trending toward 1%, if there are
+> open P0/P1 incidents, or outside the agreed release window.
+
+### Triggering an Automatic Rollback
+
+The automatic rollback is built into `deploy-canary.yml` and fires without
+intervention when the error-rate gate fails. To force the same path manually
+(e.g. you spot a regression the metric missed), re-run the workflow's
+`rollback` job from the Actions UI, or cancel the run before promotion — the
+canary is discarded and traffic returns to the stable deployment.
+
+### Manual Rollback Procedure
+
+Use this when a bad release has already reached 100% of traffic, or when the
+automated path is unavailable.
+
+**Option A — Vercel dashboard (preferred)**
+
+1. Open the project in the Vercel dashboard → **Deployments**.
+2. Locate the last known-good **Production** deployment (the previous blue).
+3. Use the deployment's **⋯ → Promote to Production** action to instantly shift
+   100% of traffic back to it.
+
+**Option B — Vercel CLI**
+
+```bash
+# List recent deployments to find the last known-good one
+vercel ls --token $VERCEL_TOKEN
+
+# Roll production back to the previous deployment
+vercel rollback --token $VERCEL_TOKEN
+
+# Or roll back to a specific deployment URL
+vercel rollback <deployment-url> --token $VERCEL_TOKEN
+```
+
+### Post-Rollback Verification
+
+After rolling back, confirm the system is healthy before closing the incident:
+
+1. **Error rate recovered**: Grafana/Loki error rate back below 1% over 5 minutes
+   (`LumigiftHighErrorRate` alert resolved).
+2. **Traffic on stable build**: Vercel dashboard shows the previous deployment
+   serving 100% of production traffic.
+3. **Smoke checks pass**:
    ```bash
-   aws rds promote-read-replica \
-     --region "$SECONDARY_REGION" \
-     --db-instance-identifier "$REPLICA_INSTANCE_ID"
+   curl -fsS https://lumigift.app/api/health
+   curl -fsS https://lumigift.app/api/v1/gifts
    ```
-   Wait until `DBInstanceStatus` is `available` (typically 5–15 minutes):
-   ```bash
-   aws rds wait db-instance-available \
-     --region "$SECONDARY_REGION" \
-     --db-instance-identifier "$REPLICA_INSTANCE_ID"
-   ```
-
-3. **Update the connection string / secret**:
-   - The application reads `DATABASE_URL` from AWS Secrets Manager (see
-     [Credential Rotation](#credential-rotation-issue-556)); it does **not** use a static
-     env var.
-   - Update the secret to point at the promoted instance endpoint:
-     ```bash
-     aws secretsmanager update-secret \
-       --secret-id "$DB_SECRET_ID" \
-       --secret-string "{\"url\":\"postgres://$DB_USER:$DB_PASSWORD@$NEW_ENDPOINT:5432/$DB_NAME?sslmode=require\"}"
-     ```
-   - If a DNS CNAME (e.g. `db.lumigift.app`) fronts the database, repoint it at the new
-     endpoint instead so no secret change is needed.
-
-4. **Swap the connection pool (blue-green, no downtime)**:
-   - The app fetches credentials on pool creation and refreshes on a short TTL. Trigger a
-     rolling pool swap by redeploying or by calling the internal pool-refresh hook so new
-     connections use the promoted primary while in-flight requests drain on the old pool.
-   - Verify no connection errors during the swap in the logs dashboard.
-
-5. **Validate application health**:
-   - `GET /api/health` returns `checks.database: "ok"`.
-   - Run a read and a write smoke test:
-     ```bash
-     psql "$DATABASE_URL" -c "SELECT 1;"
-     psql "$DATABASE_URL" -c "INSERT INTO health_probe(ts) VALUES (NOW()) RETURNING id;"
-     ```
-   - Confirm error rate and latency are back to baseline on the dashboard.
-   - Record the timestamp — this is the RTO end. **RTO = end − start; must be < 30 min.**
-
-6. **Rollback** (if the promoted replica is unhealthy or the primary recovers):
-   - If the original primary is still intact, repoint the secret/DNS back to it and swap
-     the pool again.
-   - If the original primary is lost, do **not** roll back — keep the promoted replica and
-     rebuild a new cross-region replica from it via Terraform.
-   - Document the decision and any data loss (RPO window) in the incident channel.
-
-### Failover Drill (Test Procedure)
-
-Run this drill quarterly (and before any launch gate) in a staging environment that
-mirrors production topology:
-
-1. Note the start time.
-2. Simulate primary-region loss (stop the primary or block its security group).
-3. Execute steps 2–5 above against the staging replica.
-4. Confirm `/api/health` is green and smoke tests pass.
-5. Record the measured RTO in the table below. If RTO ≥ 30 minutes, file a follow-up
-   issue to close the gap.
-
-| Drill date | Measured RTO | Result | Notes |
-| ---------- | ------------ | ------ | ----- |
-| _Pending_  | —            | —      | First drill to be run before launch gate |
-
-### Cost Impact
-
-The cross-region read replica roughly doubles database cost for the primary instance
-(replica instance hours + cross-region data transfer for replication). Estimate:
-
-- **Replica instance**: same class as primary (~2× primary instance cost).
-- **Cross-region data transfer**: replication traffic billed at the inter-region rate.
-- **Storage**: replica storage billed at the same rate as primary storage.
-
-Review the AWS Cost Explorer `RDS` and `DataTransfer` line items monthly; if the replica
-cost is not justified, downgrade the replica instance class (accepting a longer RTO).
-
----
-
-## Credential Rotation (Issue #556)
-
-Database credentials are rotated automatically every **90 days** via an AWS Secrets
-Manager rotation Lambda attached to the RDS secret. The application fetches credentials
-through the Secrets Manager SDK (never a static env var) and swaps its connection pool
-blue-green so rotation causes **no downtime**.
-
-- **Rotation schedule**: 90 days, automatic.
-- **Rotation drill**: documented and tested in
-  [key-rotation.md](./key-rotation.md#database-credential-rotation-drill). Run the drill
-  after any change to the rotation Lambda or the pool-refresh logic.
-- **Verification**: after a rotation, confirm `/api/health` is green and that new
-  connections use the rotated credential (check the secret version in Secrets Manager).
+4. **Cron jobs healthy**: no new `cron.dead_letter` entries (see
+   [Cron Job Failure](#cron-job-failure)).
+5. **Data integrity**: confirm no partial writes from the bad release (check
+   recent DB changes and, for escrow, run the reconciliation query in
+   [DB ↔ On-Chain Reconciliation Mismatch](#incident-db--on-chain-reconciliation-mismatch)).
+6. **Communicate**: post a resolution update in Slack `#incidents` and open a
+   blameless post-mortem for any P0/P1.
 
 ---
 
