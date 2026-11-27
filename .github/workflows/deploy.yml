@@ -2,7 +2,6 @@ name: Deploy to Production
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   schedule:
     # Weekly fuzz run (issue #532) — Sundays at 02:00 UTC
@@ -263,6 +262,11 @@ jobs:
           SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
 
+      # ── Promotion to production ─────────────────────────────────────────────
+      # Main-branch releases are already live on the canary deployment and have
+      # passed the 15-minute / 1% error-rate gate plus explicit approval in the
+      # Canary Deployment workflow. Here we only promote that verified build to
+      # 100% of production traffic. Tag pushes deploy directly.
       - name: Deploy to Vercel
         id: deploy
         uses: amondnet/vercel-action@9f74b3dd5db549fd4b35b62e18ce9c965cdfa1c3 # v2.3.0
@@ -393,7 +397,10 @@ jobs:
           echo "🚨 Smoke tests FAILED for commit $GITHUB_SHA"
           echo "Rollback to the previous production deployment is required."
           echo ""
-          echo "To roll back manually:"
+          echo "Follow the documented rollback procedure:"
+          echo "  docs/ops/runbook.md → 'Rollback Procedure'"
+          echo ""
+          echo "Summary:"
           echo "  1. Go to https://vercel.com/dashboard"
           echo "  2. Navigate to the Lumigift project → Deployments"
           echo "  3. Find the last successful production deployment"
@@ -439,7 +446,7 @@ jobs:
             echo "✅ Automatic rollback succeeded."
           else
             echo "⚠️  Automatic rollback failed — manual intervention required."
-            echo "    See instructions above for manual rollback steps."
+            echo "    Follow docs/ops/runbook.md → 'Rollback Procedure'."
             # Exit non-zero so the job is marked failed and engineers are notified
             exit 1
           fi
