@@ -30,6 +30,7 @@ import {
   CURSOR_GENESIS,
   type FetchEventsResult,
 } from "@/lib/contracts/escrow-events";
+import { EventIndexerService } from "@/lib/contracts/event-indexer.service";
 
 // ─── Stellar SDK mock ─────────────────────────────────────────────────────────
 // We mock the stellar-sdk at the module level so EscrowClient never dials the

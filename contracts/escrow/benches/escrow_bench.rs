@@ -13,7 +13,7 @@
 //! `target/escrow-bench-report.md` for CI to post on the PR.
 
 use criterion::{criterion_group, Criterion};
-use lumigift_escrow::{EscrowContract, EscrowContractClient, USDC_TESTNET};
+use lumigift_escrow::{EscrowContract, EscrowContractClient, GiftParams, Network, USDC_TESTNET};
 use soroban_sdk::{
     contract, contractimpl,
     testutils::{Address as _, Ledger},
@@ -24,6 +24,10 @@ const REGRESSION_TOLERANCE_PCT: u64 = 10;
 const BASELINE_MD: &str = include_str!("../BENCHMARKS.md");
 const AMOUNT: i128 = 100_000_000;
 const UNLOCK_TIME: u64 = 3_601;
+/// Maximum number of gifts accepted by a single `batch_initialize` call.
+const MAX_BATCH_SIZE: u32 = 20;
+/// Cancellation reason code used by the benchmark (sender_requested).
+const CANCEL_REASON_SENDER_REQUESTED: u32 = 1;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -96,6 +100,21 @@ impl Fixture {
         );
     }
 
+    /// Builds `MAX_BATCH_SIZE` gift params, each funded with `AMOUNT`.
+    fn batch_params(&self) -> soroban_sdk::Vec<GiftParams> {
+        let mut params = soroban_sdk::Vec::new(&self.env);
+        for _ in 0..MAX_BATCH_SIZE {
+            params.push_back(GiftParams {
+                sender: self.sender.clone(),
+                recipient: self.recipient.clone(),
+                token: self.token_id.clone(),
+                amount: AMOUNT,
+                unlock_time: UNLOCK_TIME,
+            });
+        }
+        params
+    }
+
     fn initialized() -> Self {
         let f = Self::new();
         f.initialize();
@@ -121,7 +140,14 @@ fn op_claim(f: &Fixture) {
 }
 
 fn op_cancel(f: &Fixture) {
-    f.client().cancel();
+    f.client().cancel(&CANCEL_REASON_SENDER_REQUESTED);
+}
+
+/// Measures a full `MAX_BATCH_SIZE` batch so the batch-vs-individual fee
+/// comparison in BENCHMARKS.md can be derived from a single measurement.
+fn op_batch_initialize(f: &Fixture) {
+    f.client()
+        .batch_initialize(&f.admin, &f.batch_params(), &Network::Testnet);
 }
 
 fn op_extend_ttl(f: &Fixture) {
